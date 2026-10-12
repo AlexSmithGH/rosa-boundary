@@ -99,6 +99,29 @@ resource "aws_efs_file_system_policy" "sre_home" {
             "elasticfilesystem:AccessPointArn" = "false"
           }
         }
+      },
+      {
+        # The reaper needs root access to remove stale investigation directories.
+        # Do not grant its role access to dynamically created investigation APs.
+        Sid    = "AllowReaperViaDedicatedAccessPoint"
+        Effect = "Allow"
+        Principal = {
+          AWS = data.aws_iam_role.reap_investigations_lambda.arn
+        }
+        Action = [
+          "elasticfilesystem:ClientMount",
+          "elasticfilesystem:ClientWrite",
+          "elasticfilesystem:ClientRootAccess",
+        ]
+        Resource = aws_efs_file_system.sre_home.arn
+        Condition = {
+          Bool = {
+            "elasticfilesystem:AccessedViaMountTarget" = "true"
+          }
+          StringEquals = {
+            "elasticfilesystem:AccessPointArn" = aws_efs_access_point.reaper.arn
+          }
+        }
       }
     ]
   })

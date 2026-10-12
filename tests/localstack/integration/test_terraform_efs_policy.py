@@ -38,29 +38,30 @@ def test_terraform_efs_policy_uses_null_condition():
 
     policy_block = policy_match.group(1)
 
-    # Key assertions: must use Null, must NOT use StringEquals
-    # Search the entire policy block for these patterns
-    assert 'Null' in policy_block, \
+    # Only the task role needs dynamic access points; the reaper is pinned to its
+    # dedicated root access point in a separate statement.
+    task_policy_block = policy_block.split('AllowReaperViaDedicatedAccessPoint')[0]
+    assert 'Null' in task_policy_block, \
         "Filesystem policy must use Null condition to allow dynamic access points"
 
-    assert '"elasticfilesystem:AccessPointArn"' in policy_block, \
+    assert '"elasticfilesystem:AccessPointArn"' in task_policy_block, \
         "Filesystem policy must check for AccessPointArn"
 
-    assert 'StringEquals' not in policy_block, \
+    assert 'StringEquals' not in task_policy_block, \
         "REGRESSION DETECTED: Filesystem policy uses StringEquals with specific ARN, " \
         "which breaks Lambda-created dynamic access points. Use Null condition instead. " \
         "See PR #167 for context."
 
     # Validate the Null condition requires access point (value = "false")
     null_pattern = r'Null\s*=\s*{\s*"elasticfilesystem:AccessPointArn"\s*=\s*"false"'
-    assert re.search(null_pattern, policy_block), \
+    assert re.search(null_pattern, task_policy_block), \
         "Null condition must be set to 'false' to require access point presence"
 
     # Also validate the Bool condition is present
-    assert 'Bool' in policy_block, \
+    assert 'Bool' in task_policy_block, \
         "Filesystem policy must include Bool condition for AccessedViaMountTarget"
 
-    assert 'AccessedViaMountTarget' in policy_block, \
+    assert 'AccessedViaMountTarget' in task_policy_block, \
         "Filesystem policy must require access via mount target"
 
 
@@ -119,3 +120,21 @@ def test_terraform_efs_policy_structure_complete():
     for pattern, description in broken_patterns:
         assert not re.search(pattern, policy_content, re.DOTALL), \
             f"SECURITY ISSUE: {description}"
+
+
+@pytest.mark.integration
+def test_reaper_lambda_waits_for_efs_permissions():
+    """Lambda creation must follow both EFS authorization policies."""
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
+    with open(os.path.join(repo_root, 'deploy/regional/lambda-reap-investigations.tf')) as f:
+        content = f.read()
+
+    function = re.search(
+        r'resource\s+"aws_lambda_function"\s+"reap_investigations"\s*{(.+?)\n}',
+        content, re.DOTALL
+    )
+    assert function, "Reaper Lambda resource not found"
+    dependencies = re.search(r'depends_on\s*=\s*\[([^]]+)\]', function.group(1))
+    assert dependencies, "Reaper Lambda must wait for EFS authorization"
+    assert 'aws_iam_role_policy.reap_investigations_lambda_efs' in dependencies.group(1)
+    assert 'aws_efs_file_system_policy.sre_home' in dependencies.group(1)

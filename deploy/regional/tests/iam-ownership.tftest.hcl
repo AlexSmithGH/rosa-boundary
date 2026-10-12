@@ -15,6 +15,9 @@ mock_provider "aws" {
   mock_resource "aws_efs_file_system" {
     defaults = { arn = "arn:aws:elasticfilesystem:us-east-1:123456789012:file-system/fs-0123456789abcdef0" }
   }
+  mock_resource "aws_efs_access_point" {
+    defaults = { arn = "arn:aws:elasticfilesystem:us-east-1:123456789012:access-point/fsap-0123456789abcdef0" }
+  }
   mock_resource "aws_kms_key" {
     defaults = { arn = "arn:aws:kms:us-east-1:123456789012:key/11111111-1111-1111-1111-111111111111" }
   }
@@ -95,9 +98,10 @@ run "legacy_policy_names_ownership_and_original_scopes" {
   }
   assert {
     condition = alltrue([for f in fileset(path.module, "*.tf") :
-      length(regexall("resource \\\"aws_iam_role\\\"|resource \\\"aws_iam_role_policy_attachment\\\"|resource \\\"aws_iam_openid_connect_provider\\\"|aws_iam_role_policies_exclusive|aws_iam_role_policy_attachments_exclusive", file("${path.module}/${f}"))) == 0
+      length(regexall("resource \\\"aws_iam_role\\\"|resource \\\"aws_iam_openid_connect_provider\\\"|aws_iam_role_policies_exclusive|aws_iam_role_policy_attachments_exclusive", file("${path.module}/${f}"))) == 0 &&
+      length(regexall("resource \\\"aws_iam_role_policy_attachment\\\"", file("${path.module}/${f}"))) == (f == "lambda-reap-investigations.tf" ? 1 : 0)
     ]) && length(regexall("from = aws_iam_role_policy\\.", file("${path.module}/account-handoff.tf"))) == 0
-    error_message = "Regional state owns no identities/common attachments and must never release or exclusively reconcile regional grants."
+    error_message = "Regional state owns no identities/common attachments except the reaper's regional VPC attachment."
   }
   assert {
     condition = (
@@ -108,6 +112,9 @@ run "legacy_policy_names_ownership_and_original_scopes" {
       aws_iam_role_policy.lambda_invoker.role == data.aws_iam_role.lambda_invoker.id &&
       aws_iam_role_policy.create_investigation_lambda_ecs.role == data.aws_iam_role.create_investigation_lambda.id &&
       aws_iam_role_policy.reap_tasks_lambda_ecs.role == data.aws_iam_role.reap_tasks_lambda.id &&
+      aws_iam_role_policy.reap_investigations_lambda_efs.role == data.aws_iam_role.reap_investigations_lambda.id &&
+      aws_iam_role_policy_attachment.reap_investigations_lambda_vpc.role == data.aws_iam_role.reap_investigations_lambda.name &&
+      aws_iam_role_policy_attachment.reap_investigations_lambda_vpc.policy_arn == "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole" &&
       aws_iam_role_policy.bedrock_invocation_logging.role == data.aws_iam_role.bedrock_invocation_logging.id &&
       aws_iam_role_policy.s3_replication[0].role == data.aws_iam_role.s3_replication[0].id
     )
@@ -168,6 +175,21 @@ run "legacy_policy_names_ownership_and_original_scopes" {
     )
     error_message = "Preserve exact Lambda invocation, PassRole, filesystem and deadline-reaper scopes."
   }
+  assert {
+    condition = (
+      length(jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement) == 2 &&
+      jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement[0].Principal.AWS == data.aws_iam_role.task.arn &&
+      jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement[0].Condition.Null["elasticfilesystem:AccessPointArn"] == "false" &&
+      jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement[1].Principal.AWS == data.aws_iam_role.reap_investigations_lambda.arn &&
+      jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement[1].Action == ["elasticfilesystem:ClientMount", "elasticfilesystem:ClientWrite", "elasticfilesystem:ClientRootAccess"] &&
+      jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement[1].Resource == aws_efs_file_system.sre_home.arn &&
+      jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement[1].Condition.Bool["elasticfilesystem:AccessedViaMountTarget"] == "true" &&
+      jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement[1].Condition.StringEquals["elasticfilesystem:AccessPointArn"] == aws_efs_access_point.reaper.arn &&
+      jsondecode(aws_iam_role_policy.reap_investigations_lambda_efs.policy).Statement[2].Condition.StringEquals["elasticfilesystem:AccessPointArn"] == aws_efs_access_point.reaper.arn &&
+      jsondecode(aws_iam_role_policy.reap_investigations_lambda_efs.policy).Statement[2].Resource == aws_efs_file_system.sre_home.arn
+    )
+    error_message = "EFS must grant reaper mount/write/root access in both policies only via its dedicated access point; task access remains dynamic."
+  }
 }
 
 run "additional_region_names_cannot_collide_with_legacy_grants" {
@@ -202,6 +224,13 @@ run "additional_region_names_cannot_collide_with_legacy_grants" {
       jsondecode(aws_iam_role_policy.task_bedrock.policy).Statement[1].Resource == ["arn:aws:bedrock:us-west-2:123456789012:inference-profile/*", "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/*"]
     )
     error_message = "A second region must render its own scopes, never copy the legacy region's grants."
+  }
+  assert {
+    condition = (
+      jsondecode(aws_iam_role_policy.reap_investigations_lambda_efs.policy).Statement[1].Resource == "arn:aws:elasticfilesystem:us-west-2:123456789012:access-point/*" &&
+      jsondecode(aws_efs_file_system_policy.sre_home.policy).Statement[1].Condition.StringEquals["elasticfilesystem:AccessPointArn"] == aws_efs_access_point.reaper.arn
+    )
+    error_message = "The reaper EFS permissions must use the deployed region and dedicated regional access point."
   }
 }
 

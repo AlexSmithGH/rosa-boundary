@@ -39,12 +39,12 @@ resource "aws_iam_role_policy" "reap_investigations_lambda_ecs" {
       {
         Effect   = "Allow"
         Action   = "ecs:ListTaskDefinitions"
-        Resource = "*"  # ListTaskDefinitions requires wildcard resource
+        Resource = "*" # ListTaskDefinitions requires wildcard resource
       },
       {
         Effect   = "Allow"
         Action   = "ecs:DeregisterTaskDefinition"
-        Resource = "*"  # DeregisterTaskDefinition does not support resource-level permissions
+        Resource = "*" # DeregisterTaskDefinition does not support resource-level permissions
       }
     ]
   })
@@ -59,14 +59,14 @@ resource "aws_iam_role_policy" "reap_investigations_lambda_efs" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
+        Effect   = "Allow"
         Action   = "elasticfilesystem:DescribeAccessPoints"
         Resource = aws_efs_file_system.sre_home.arn
       },
       {
         Effect   = "Allow"
         Action   = "elasticfilesystem:DeleteAccessPoint"
-        Resource = "arn:${data.aws_partition.current.partition}:elasticfilesystem:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:access-point/*"
+        Resource = "arn:${data.aws_partition.current.partition}:elasticfilesystem:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:access-point/*"
         Condition = {
           StringEquals = {
             # Investigation access points created by the OIDC Lambda carry this tag.
@@ -102,8 +102,8 @@ resource "aws_iam_role_policy" "reap_investigations_lambda_s3" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
-        Action = "s3:ListBucket"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
         Resource = aws_s3_bucket.audit.arn
         Condition = {
           StringLike = {
@@ -129,12 +129,12 @@ resource "aws_efs_access_point" "reaper" {
   file_system_id = aws_efs_file_system.sre_home.id
 
   posix_user {
-    uid = 0  # root user
-    gid = 0  # root group
+    uid = 0 # root user
+    gid = 0 # root group
   }
 
   root_directory {
-    path = "/"  # Root of filesystem for full access
+    path = "/" # Root of filesystem for full access
 
     creation_info {
       owner_uid   = 0
@@ -190,11 +190,11 @@ resource "aws_lambda_function" "reap_investigations" {
 
   environment {
     variables = {
-      ECS_CLUSTER             = aws_ecs_cluster.main.name
-      EFS_FILESYSTEM_ID       = aws_efs_file_system.sre_home.id
-      GRACE_PERIOD_HOURS      = var.investigation_grace_period_hours
-      S3_AUDIT_BUCKET         = aws_s3_bucket.audit.id
-      TASK_DEFINITION_FAMILY  = aws_ecs_task_definition.rosa_boundary.family
+      ECS_CLUSTER            = aws_ecs_cluster.main.name
+      EFS_FILESYSTEM_ID      = aws_efs_file_system.sre_home.id
+      GRACE_PERIOD_HOURS     = var.investigation_grace_period_hours
+      S3_AUDIT_BUCKET        = aws_s3_bucket.audit.id
+      TASK_DEFINITION_FAMILY = aws_ecs_task_definition.rosa_boundary.family
     }
   }
 
@@ -213,6 +213,8 @@ resource "aws_lambda_function" "reap_investigations" {
   depends_on = [
     aws_cloudwatch_log_group.reap_investigations_lambda,
     aws_iam_role_policy_attachment.reap_investigations_lambda_vpc,
+    aws_iam_role_policy.reap_investigations_lambda_efs,
+    aws_efs_file_system_policy.sre_home,
     aws_efs_mount_target.sre_home # Ensure mount targets exist before Lambda tries to mount
   ]
 
