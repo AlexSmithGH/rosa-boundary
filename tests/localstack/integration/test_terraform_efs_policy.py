@@ -136,5 +136,7 @@ def test_reaper_lambda_waits_for_efs_permissions():
     assert function, "Reaper Lambda resource not found"
     dependencies = re.search(r'depends_on\s*=\s*\[([^]]+)\]', function.group(1))
     assert dependencies, "Reaper Lambda must wait for EFS authorization"
-    assert 'aws_iam_role_policy.reap_investigations_lambda_efs' in dependencies.group(1)
-    assert 'aws_efs_file_system_policy.sre_home' in dependencies.group(1)
+    entries = re.sub(r'#[^\n]*', '', dependencies.group(1))
+    names = {entry.strip() for entry in entries.split(',') if entry.strip()}
+    assert 'aws_iam_role_policy.reap_investigations_lambda_efs' in names
+    assert 'aws_efs_file_system_policy.sre_home' in names
