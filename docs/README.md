@@ -12,7 +12,7 @@ The ROSA Boundary system provides secure, audited access to ephemeral SRE contai
 ## Architecture Documentation
 
 - [**System Overview**](architecture/overview.md) - High-level architecture with diagrams
-- [**CLI Authentication**](architecture/cli-authentication.md) - How the CLI authenticates: OIDC-bootstrapped vs ambient AWS credentials
+- [**CLI Authentication**](architecture/cli-authentication.md) - How the CLI exchanges an OIDC token for temporary AWS credentials
 - [**Investigations and Tasks**](architecture/investigations-and-tasks.md) - Conceptual model, lifecycle, state recording, and FAQ
 
 ## Configuration Guides
@@ -35,6 +35,7 @@ The ROSA Boundary system provides secure, audited access to ephemeral SRE contai
 
 ## Development
 
+- [**Development Standards**](development-standards.md) - Contribution rules and pre-PR quality gates
 - [**Dependency Management Automation**](dependency-management-automation.md) - Dependabot and Mintmaker/Renovate configuration and strategy
 
 ## Quick Start
