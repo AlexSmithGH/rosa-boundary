@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Import and resume opt-in Cora handoffs using only the Python standard library."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from uuid import UUID
+
+MAX_BYTES = 4 * 1024 * 1024
+
+
+def uuid_value(value):
+    if not isinstance(value, str) or str(UUID(value)) != value:
+        raise ValueError("Expected a canonical session/run UUID")
+    return value
+
+
+def safe_text(value):
+    return "".join(c for c in str(value) if c.isprintable() or c in "\n\t")
+
+
+def read_response(stream):
+    raw = stream.read(2 * MAX_BYTES + 1)
+    if len(raw) > 2 * MAX_BYTES:
+        raise ValueError("Response exceeds the 8 MiB PoC limit")
+    text = raw.decode("utf-8")
+    try:
+        response = json.loads(text)
+    except json.JSONDecodeError:
+        # AgentCore can wrap the final JSON response in an SSE data event.
+        events = [line[6:] for line in text.splitlines() if line.startswith("data: ")]
+        if len(events) != 1:
+            raise ValueError(
+                "Expected JSON or a single AgentCore result event"
+            ) from None
+        response = json.loads(events[0])
+        if isinstance(response, str):
+            response = json.loads(response)
+    if not isinstance(response, dict):
+        raise TypeError("Expected an object response")
+    return response.get("handoff", response)
+
+
+def validate(bundle):
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("kind") != "cora.boundary.handoff"
+        or type(bundle.get("schema_version")) is not int
+        or bundle["schema_version"] != 1
+    ):
+        raise ValueError("Unsupported Cora handoff schema")
+    if len(json.dumps(bundle).encode()) > MAX_BYTES:
+        raise ValueError("Handoff exceeds the 4 MiB PoC limit")
+    uuid_value(bundle.get("run_id"))
+    for key in ("cluster_id", "investigation_id"):
+        expected = os.environ.get(key.upper())
+        if not expected or bundle.get(key) != expected:
+            raise ValueError(f"Handoff does not match this task's {key.upper()}")
+    result = bundle.get("result")
+    if not isinstance(result, dict) or any(
+        result.get(k) != bundle[k] for k in ("cluster_id", "investigation_id")
+    ):
+        raise ValueError("Result identity does not match the handoff")
+    sessions = bundle.get("sessions")
+    if not isinstance(sessions, list) or not 1 <= len(sessions) <= 3:
+        raise ValueError("Expected one to three tier sessions")
+    ids = set()
+    for session in sessions:
+        sid = uuid_value(session["session_id"])
+        if sid in ids:
+            raise ValueError("Duplicate session ID")
+        ids.add(sid)
+        transcript = session["transcript"]
+        if (
+            not isinstance(transcript, str)
+            or hashlib.sha256(transcript.encode()).hexdigest() != session["sha256"]
+        ):
+            raise ValueError("Transcript checksum mismatch")
+        records = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+        if not records or any(
+            not isinstance(r, dict) or r.get("sessionId", sid) != sid for r in records
+        ):
+            raise ValueError("Invalid native transcript")
+        if not any(r.get("type") == "user" for r in records):
+            raise ValueError("Native transcript has no user conversation")
+    if bundle.get("resume_session_id") not in ids:
+        raise ValueError("Continuation session is missing")
+    return bundle
+
+
+def directory(path):
+    """Reject symlink components before writing beneath the persistent home."""
+    for parent in [*reversed(path.parents), path]:
+        if parent.is_symlink():
+            raise ValueError("Refusing a symlink in the handoff destination")
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+
+def import_bundle(bundle, home):
+    validate(bundle)
+    root = directory(home / "cora")
+    target = root / bundle["run_id"]
+    encoded = json.dumps(bundle, indent=2, ensure_ascii=False) + "\n"
+    if target.exists() or target.is_symlink():
+        if (
+            target.is_symlink()
+            or (target / "bundle.json").is_symlink()
+            or (target / "bundle.json").read_text() != encoded
+        ):
+            raise ValueError(
+                "Run already exists with different contents; refusing overwrite"
+            )
+    else:
+        staging = Path(tempfile.mkdtemp(prefix=".import-", dir=root))
+        try:
+            (staging / "bundle.json").write_text(encoded)
+            (staging / "result.json").write_text(
+                json.dumps(bundle["result"], indent=2) + "\n"
+            )
+            for session in bundle["sessions"]:
+                (staging / f"{session['session_id']}.jsonl").write_text(
+                    session["transcript"]
+                )
+            staging.rename(target)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+    # Atomic pointer update; replacement replaces a symlink rather than following it.
+    fd, pointer = tempfile.mkstemp(prefix=".latest-", dir=root)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(bundle["run_id"])
+        os.replace(pointer, root / "latest")
+    finally:
+        if os.path.exists(pointer):
+            os.unlink(pointer)
+    return target
+
+
+def load_bundle(home):
+    root = home / "cora"
+    if not (root / "latest").exists():
+        return None
+    directory(root)
+    if (root / "latest").is_symlink():
+        raise ValueError("Refusing symlink handoff pointer")
+    run_id = uuid_value((root / "latest").read_text())
+    directory(root / run_id)
+    path = root / run_id / "bundle.json"
+    if path.is_symlink():
+        raise ValueError("Refusing symlink handoff bundle")
+    with path.open("rb") as stream:
+        return validate(read_response(stream))
+
+
+def show(bundle, transcript=False):
+    print(f"Cora investigation: {safe_text(bundle['investigation_id'])}")
+    print(safe_text(bundle["result"].get("summary", "")))
+    if transcript:
+        for session in bundle["sessions"]:
+            print(f"\nTier {safe_text(session['tier'])} — {session['session_id']}")
+            for line in session["transcript"].splitlines():
+                if line.strip():
+                    record = json.loads(line)
+                    if record.get("type") in ("user", "assistant"):
+                        print(
+                            safe_text(
+                                json.dumps(
+                                    record.get("message", {}),
+                                    ensure_ascii=False,
+                                    indent=2,
+                                )
+                            )
+                        )
+    else:
+        print(
+            "Use cora-handoff show --transcript for history; cora-handoff resume to continue."
+        )
+
+
+def resume(bundle, home):
+    # Install under the CURRENT cwd key, including for Boundary's older pinned CLI.
+    # Keep Boundary's settings and credentials: never import a Cora config directory.
+    config = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(home / ".claude")))
+    project = re.sub(r"[^a-zA-Z0-9]", "-", str(home))
+    destination = directory(config / "projects" / project)
+    sid = bundle["resume_session_id"]
+    session = next(s for s in bundle["sessions"] if s["session_id"] == sid)
+    path = destination / f"{sid}.jsonl"
+    if path.is_symlink():
+        raise ValueError("Refusing symlink Claude transcript")
+    # Once restored, Claude owns this copy. Never overwrite subsequent human turns.
+    if not path.exists():
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(session["transcript"])
+    show(bundle)
+    print(
+        "Continuing with this task's credentials and installed tools. Cora's evidence files and plugins are not transferred by this PoC.",
+        flush=True,
+    )
+    os.chdir(home)
+    os.execvp(
+        "claude",
+        [
+            "claude",
+            "--resume",
+            sid,
+            "--append-system-prompt",
+            "An SRE is continuing an imported Cora investigation in Boundary. Ask the SRE what to investigate next. Prior credentials and absolute paths may be stale; use this task's credentials. Earlier tier transcripts and the report are in ~/cora/.",
+        ],
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    importer = commands.add_parser(
+        "import", help="Import a response file, or - for stdin"
+    )
+    importer.add_argument("file")
+    display = commands.add_parser(
+        "show", help="Display the most recently imported investigation"
+    )
+    display.add_argument("--transcript", action="store_true")
+    commands.add_parser("resume", help="Resume the imported Claude session")
+    args = parser.parse_args()
+    home = Path.home().resolve()
+    try:
+        if args.command == "import":
+            if args.file == "-":
+                bundle = read_response(sys.stdin.buffer)
+            else:
+                with open(args.file, "rb") as stream:
+                    bundle = read_response(stream)
+            target = import_bundle(bundle, home)
+            print(f"Imported Cora handoff into {target}")
+            show(bundle)
+        else:
+            bundle = load_bundle(home)
+            if bundle is None:
+                if args.command == "resume":
+                    raise ValueError("No imported Cora handoff")
+                return
+            if args.command == "show":
+                show(bundle, args.transcript)
+            else:
+                resume(bundle, home)
+    except (ValueError, KeyError, TypeError, OSError) as error:
+        parser.exit(1, f"Cora handoff failed: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
